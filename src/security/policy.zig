@@ -458,7 +458,8 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
         // find -exec and find -ok allow arbitrary command execution
         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
         while (iter.next()) |arg| {
-            if (std.mem.eql(u8, arg, "-exec") or std.mem.eql(u8, arg, "-ok")) {
+            const normalized_arg = normalizeShellArgToken(arg);
+            if (std.mem.eql(u8, normalized_arg, "-exec") or std.mem.eql(u8, normalized_arg, "-ok")) {
                 return false;
             }
         }
@@ -470,11 +471,12 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
         _ = iter.next(); // skip "git" itself
         while (iter.next()) |arg| {
-            if (std.mem.eql(u8, arg, "config") or
-                std.mem.startsWith(u8, arg, "config.") or
-                std.mem.eql(u8, arg, "alias") or
-                std.mem.startsWith(u8, arg, "alias.") or
-                std.mem.eql(u8, arg, "-c"))
+            const normalized_arg = normalizeShellArgToken(arg);
+            if (std.mem.eql(u8, normalized_arg, "config") or
+                std.mem.startsWith(u8, normalized_arg, "config.") or
+                std.mem.eql(u8, normalized_arg, "alias") or
+                std.mem.startsWith(u8, normalized_arg, "alias.") or
+                std.mem.eql(u8, normalized_arg, "-c"))
             {
                 return false;
             }
@@ -487,6 +489,27 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
 
 fn containsStr(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
+}
+
+/// Normalize a shell token for policy matching.
+/// - strips one layer of surrounding single/double quotes
+/// - strips leading backslashes before an option dash (e.g. \-exec -> -exec)
+fn normalizeShellArgToken(token_in: []const u8) []const u8 {
+    var token = token_in;
+
+    if (token.len >= 2) {
+        const first = token[0];
+        const last = token[token.len - 1];
+        if ((first == '\'' and last == '\'') or (first == '"' and last == '"')) {
+            token = token[1 .. token.len - 1];
+        }
+    }
+
+    while (token.len >= 2 and token[0] == '\\' and token[1] == '-') {
+        token = token[1..];
+    }
+
+    return token;
 }
 
 /// Fixed-size buffer for lowercase conversion
@@ -1073,6 +1096,14 @@ test "find -exec is blocked" {
     try std.testing.expect(!p.isCommandAllowed("find / -ok cat {} \\;"));
 }
 
+test "find quoted and escaped -exec is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("find . '-exec' rm -rf {} +"));
+    try std.testing.expect(!p.isCommandAllowed("find . \"-ok\" cat {} \\;"));
+    try std.testing.expect(!p.isCommandAllowed("find . \\-exec rm -rf {} +"));
+    try std.testing.expect(!p.isCommandAllowed("find . \\-ok cat {} \\;"));
+}
+
 test "find -name is allowed" {
     const p = SecurityPolicy{};
     try std.testing.expect(p.isCommandAllowed("find . -name '*.txt'"));
@@ -1084,6 +1115,13 @@ test "git config is blocked" {
     try std.testing.expect(!p.isCommandAllowed("git config core.editor \"rm -rf /\""));
     try std.testing.expect(!p.isCommandAllowed("git alias.st status"));
     try std.testing.expect(!p.isCommandAllowed("git -c core.editor=calc.exe commit"));
+}
+
+test "git quoted and escaped config args are blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("git '-c' core.editor=vim status"));
+    try std.testing.expect(!p.isCommandAllowed("git \\-c core.editor=vim status"));
+    try std.testing.expect(!p.isCommandAllowed("git \"config\" user.name test"));
 }
 
 test "git status is allowed" {
