@@ -456,9 +456,10 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
 
     if (std.mem.eql(u8, base, "find")) {
         // find -exec and find -ok allow arbitrary command execution
+        var normalized_storage: [4096]u8 = undefined;
         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
         while (iter.next()) |arg| {
-            const normalized_arg = normalizeShellArgToken(arg);
+            const normalized_arg = normalizeShellArgToken(arg, &normalized_storage);
             if (std.mem.eql(u8, normalized_arg, "-exec") or std.mem.eql(u8, normalized_arg, "-ok")) {
                 return false;
             }
@@ -468,10 +469,11 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
 
     if (std.mem.eql(u8, base, "git")) {
         // git config, alias, and -c can set dangerous options
+        var normalized_storage: [4096]u8 = undefined;
         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
         _ = iter.next(); // skip "git" itself
         while (iter.next()) |arg| {
-            const normalized_arg = normalizeShellArgToken(arg);
+            const normalized_arg = normalizeShellArgToken(arg, &normalized_storage);
             if (std.mem.eql(u8, normalized_arg, "config") or
                 std.mem.startsWith(u8, normalized_arg, "config.") or
                 std.mem.eql(u8, normalized_arg, "alias") or
@@ -493,9 +495,14 @@ fn containsStr(haystack: []const u8, needle: []const u8) bool {
 
 /// Normalize a shell token for policy matching.
 /// - strips one layer of surrounding single/double quotes
+/// - decodes ANSI-C shell quotes (e.g. $'\x2dexec' -> -exec)
 /// - strips leading backslashes before an option dash (e.g. \-exec -> -exec)
-fn normalizeShellArgToken(token_in: []const u8) []const u8 {
+fn normalizeShellArgToken(token_in: []const u8, buf: []u8) []const u8 {
     var token = token_in;
+
+    if (token.len >= 3 and token[0] == '$' and token[1] == '\'' and token[token.len - 1] == '\'') {
+        token = decodeAnsiCQuoted(token[2 .. token.len - 1], buf);
+    }
 
     if (token.len >= 2) {
         const first = token[0];
@@ -510,6 +517,137 @@ fn normalizeShellArgToken(token_in: []const u8) []const u8 {
     }
 
     return token;
+}
+
+fn isOctalDigit(c: u8) bool {
+    return c >= '0' and c <= '7';
+}
+
+fn hexDigitValue(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' and c <= 'F') return 10 + (c - 'A');
+    return null;
+}
+
+/// Decode ANSI-C shell quoted content inside $'...'.
+/// Supported escapes: standard single-char escapes, \xNN (up to 2 hex), and up to 3 octal digits.
+fn decodeAnsiCQuoted(in: []const u8, out: []u8) []const u8 {
+    var i: usize = 0;
+    var o: usize = 0;
+
+    while (i < in.len and o < out.len) {
+        if (in[i] != '\\') {
+            out[o] = in[i];
+            i += 1;
+            o += 1;
+            continue;
+        }
+
+        i += 1;
+        if (i >= in.len) {
+            out[o] = '\\';
+            o += 1;
+            break;
+        }
+
+        const esc = in[i];
+        switch (esc) {
+            'a' => {
+                out[o] = 0x07;
+                i += 1;
+                o += 1;
+            },
+            'b' => {
+                out[o] = 0x08;
+                i += 1;
+                o += 1;
+            },
+            'e' => {
+                out[o] = 0x1b;
+                i += 1;
+                o += 1;
+            },
+            'f' => {
+                out[o] = 0x0c;
+                i += 1;
+                o += 1;
+            },
+            'n' => {
+                out[o] = '\n';
+                i += 1;
+                o += 1;
+            },
+            'r' => {
+                out[o] = '\r';
+                i += 1;
+                o += 1;
+            },
+            't' => {
+                out[o] = '\t';
+                i += 1;
+                o += 1;
+            },
+            'v' => {
+                out[o] = 0x0b;
+                i += 1;
+                o += 1;
+            },
+            '\\' => {
+                out[o] = '\\';
+                i += 1;
+                o += 1;
+            },
+            '\'' => {
+                out[o] = '\'';
+                i += 1;
+                o += 1;
+            },
+            '"' => {
+                out[o] = '"';
+                i += 1;
+                o += 1;
+            },
+            'x' => {
+                i += 1; // consume 'x'
+                var val: u16 = 0;
+                var digits: usize = 0;
+                while (i < in.len and digits < 2) {
+                    const digit = hexDigitValue(in[i]) orelse break;
+                    val = (val * 16) + digit;
+                    i += 1;
+                    digits += 1;
+                }
+                if (digits == 0) {
+                    out[o] = 'x';
+                } else {
+                    out[o] = @as(u8, @truncate(val));
+                }
+                o += 1;
+            },
+            else => {
+                if (isOctalDigit(esc)) {
+                    var val: u16 = esc - '0';
+                    i += 1;
+                    var digits: usize = 1;
+                    while (i < in.len and digits < 3 and isOctalDigit(in[i])) {
+                        val = (val * 8) + (in[i] - '0');
+                        i += 1;
+                        digits += 1;
+                    }
+                    out[o] = @as(u8, @truncate(val));
+                    o += 1;
+                } else {
+                    // Keep unknown escapes as the escaped char itself.
+                    out[o] = esc;
+                    i += 1;
+                    o += 1;
+                }
+            },
+        }
+    }
+
+    return out[0..o];
 }
 
 /// Fixed-size buffer for lowercase conversion
@@ -1104,6 +1242,13 @@ test "find quoted and escaped -exec is blocked" {
     try std.testing.expect(!p.isCommandAllowed("find . \\-ok cat {} \\;"));
 }
 
+test "find ansi-c quoted -exec is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("find . $'-exec' rm -rf {} +"));
+    try std.testing.expect(!p.isCommandAllowed("find . $'\\x2dexec' rm -rf {} +"));
+    try std.testing.expect(!p.isCommandAllowed("find . $'\\055ok' cat {} \\;"));
+}
+
 test "find -name is allowed" {
     const p = SecurityPolicy{};
     try std.testing.expect(p.isCommandAllowed("find . -name '*.txt'"));
@@ -1122,6 +1267,14 @@ test "git quoted and escaped config args are blocked" {
     try std.testing.expect(!p.isCommandAllowed("git '-c' core.editor=vim status"));
     try std.testing.expect(!p.isCommandAllowed("git \\-c core.editor=vim status"));
     try std.testing.expect(!p.isCommandAllowed("git \"config\" user.name test"));
+}
+
+test "git ansi-c quoted config args are blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("git $'config' user.name test"));
+    try std.testing.expect(!p.isCommandAllowed("git $'-c' core.editor=vim status"));
+    try std.testing.expect(!p.isCommandAllowed("git $'\\x63onfig' user.name test"));
+    try std.testing.expect(!p.isCommandAllowed("git $'\\055c' core.editor=vim status"));
 }
 
 test "git status is allowed" {
