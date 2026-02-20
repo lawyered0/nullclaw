@@ -457,7 +457,7 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
     if (std.mem.eql(u8, base, "find")) {
         // find -exec and find -ok allow arbitrary command execution
         var normalized_storage: [4096]u8 = undefined;
-        var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
+        var iter = std.mem.tokenizeAny(u8, cmd, " \t\r\n");
         while (iter.next()) |arg| {
             const normalized_arg = normalizeShellArgToken(arg, &normalized_storage);
             if (std.mem.eql(u8, normalized_arg, "-exec") or std.mem.eql(u8, normalized_arg, "-ok")) {
@@ -470,7 +470,7 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
     if (std.mem.eql(u8, base, "git")) {
         // git config, alias, -c, and --config-env can set dangerous options
         var normalized_storage: [4096]u8 = undefined;
-        var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
+        var iter = std.mem.tokenizeAny(u8, cmd, " \t\r\n");
         _ = iter.next(); // skip "git" itself
         while (iter.next()) |arg| {
             const normalized_arg = normalizeShellArgToken(arg, &normalized_storage);
@@ -1319,6 +1319,12 @@ test "find quote-concatenated -exec is blocked" {
     try std.testing.expect(!p.isCommandAllowed("find . $'\\055''exec' rm -rf {} +"));
 }
 
+test "find tab-delimited -exec is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("find . \t-exec rm -rf {} +"));
+    try std.testing.expect(!p.isCommandAllowed("find . \t-ok cat {} \\;"));
+}
+
 test "find -name is allowed" {
     const p = SecurityPolicy{};
     try std.testing.expect(p.isCommandAllowed("find . -name '*.txt'"));
@@ -1357,6 +1363,12 @@ test "git quote-concatenated config args are blocked" {
     try std.testing.expect(!p.isCommandAllowed("git $'co''nfig' user.name test"));
     try std.testing.expect(!p.isCommandAllowed("git \"--config\"\"-env=alias.pwn=X\" pwn"));
     try std.testing.expect(!p.isCommandAllowed("git $'--config-env=alias.pwn=X' pwn"));
+}
+
+test "git tab-delimited config args are blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("git \t--config-env=alias.pwn=X pwn"));
+    try std.testing.expect(!p.isCommandAllowed("git \t-c core.editor=vim status"));
 }
 
 test "git status is allowed" {
