@@ -494,28 +494,90 @@ fn containsStr(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// Normalize a shell token for policy matching.
-/// - strips one layer of surrounding single/double quotes
-/// - decodes ANSI-C shell quotes (e.g. $'\x2dexec' -> -exec)
-/// - strips leading backslashes before an option dash (e.g. \-exec -> -exec)
+/// - resolves shell-style quote concatenation (e.g. 'co''nfig' -> config)
+/// - decodes ANSI-C quoted fragments (e.g. $'\x2d''exec' -> -exec)
+/// - resolves backslash escapes for token-local matching
 fn normalizeShellArgToken(token_in: []const u8, buf: []u8) []const u8 {
-    var token = token_in;
+    var i: usize = 0;
+    var o: usize = 0;
 
-    if (token.len >= 3 and token[0] == '$' and token[1] == '\'' and token[token.len - 1] == '\'') {
-        token = decodeAnsiCQuoted(token[2 .. token.len - 1], buf);
-    }
+    while (i < token_in.len and o < buf.len) {
+        const c = token_in[i];
 
-    if (token.len >= 2) {
-        const first = token[0];
-        const last = token[token.len - 1];
-        if ((first == '\'' and last == '\'') or (first == '"' and last == '"')) {
-            token = token[1 .. token.len - 1];
+        if (c == '\'') {
+            // Single-quoted fragment: take bytes literally until next quote.
+            i += 1;
+            while (i < token_in.len and token_in[i] != '\'' and o < buf.len) : (i += 1) {
+                buf[o] = token_in[i];
+                o += 1;
+            }
+            if (i < token_in.len and token_in[i] == '\'') i += 1;
+            continue;
         }
+
+        if (c == '"') {
+            // Double-quoted fragment: keep bytes, resolving common backslash escapes.
+            i += 1;
+            while (i < token_in.len and token_in[i] != '"' and o < buf.len) {
+                if (token_in[i] == '\\' and i + 1 < token_in.len) {
+                    const escaped = token_in[i + 1];
+                    if (escaped == '\\' or escaped == '"' or escaped == '$' or escaped == '`' or escaped == '\n') {
+                        buf[o] = escaped;
+                        o += 1;
+                        i += 2;
+                        continue;
+                    }
+                }
+                buf[o] = token_in[i];
+                o += 1;
+                i += 1;
+            }
+            if (i < token_in.len and token_in[i] == '"') i += 1;
+            continue;
+        }
+
+        if (c == '$' and i + 1 < token_in.len and token_in[i + 1] == '\'') {
+            // ANSI-C quoted fragment: decode escapes and append.
+            i += 2;
+            const seg_start = i;
+            while (i < token_in.len) {
+                if (token_in[i] == '\\' and i + 1 < token_in.len) {
+                    i += 2;
+                    continue;
+                }
+                if (token_in[i] == '\'') break;
+                i += 1;
+            }
+
+            const decoded = decodeAnsiCQuoted(token_in[seg_start..@min(i, token_in.len)], buf[o..]);
+            o += decoded.len;
+            if (i < token_in.len and token_in[i] == '\'') i += 1;
+            continue;
+        }
+
+        if (c == '\\') {
+            // Outside quotes, backslash escapes the next character in this token.
+            if (i + 1 < token_in.len) {
+                buf[o] = token_in[i + 1];
+                o += 1;
+                i += 2;
+            } else {
+                buf[o] = '\\';
+                o += 1;
+                i += 1;
+            }
+            continue;
+        }
+
+        buf[o] = c;
+        o += 1;
+        i += 1;
     }
 
+    var token = buf[0..o];
     while (token.len >= 2 and token[0] == '\\' and token[1] == '-') {
         token = token[1..];
     }
-
     return token;
 }
 
@@ -1249,6 +1311,12 @@ test "find ansi-c quoted -exec is blocked" {
     try std.testing.expect(!p.isCommandAllowed("find . $'\\055ok' cat {} \\;"));
 }
 
+test "find quote-concatenated -exec is blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("find . '-''exec' rm -rf {} +"));
+    try std.testing.expect(!p.isCommandAllowed("find . $'\\055''exec' rm -rf {} +"));
+}
+
 test "find -name is allowed" {
     const p = SecurityPolicy{};
     try std.testing.expect(p.isCommandAllowed("find . -name '*.txt'"));
@@ -1275,6 +1343,13 @@ test "git ansi-c quoted config args are blocked" {
     try std.testing.expect(!p.isCommandAllowed("git $'-c' core.editor=vim status"));
     try std.testing.expect(!p.isCommandAllowed("git $'\\x63onfig' user.name test"));
     try std.testing.expect(!p.isCommandAllowed("git $'\\055c' core.editor=vim status"));
+}
+
+test "git quote-concatenated config args are blocked" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("git 'co''nfig' user.name test"));
+    try std.testing.expect(!p.isCommandAllowed("git \"-\"\"c\" core.editor=vim status"));
+    try std.testing.expect(!p.isCommandAllowed("git $'co''nfig' user.name test"));
 }
 
 test "git status is allowed" {
