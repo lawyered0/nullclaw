@@ -468,7 +468,7 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
     }
 
     if (std.mem.eql(u8, base, "git")) {
-        // git config, alias, and -c can set dangerous options
+        // git config, alias, -c, and --config-env can set dangerous options
         var normalized_storage: [4096]u8 = undefined;
         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
         _ = iter.next(); // skip "git" itself
@@ -478,6 +478,8 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
                 std.mem.startsWith(u8, normalized_arg, "config.") or
                 std.mem.eql(u8, normalized_arg, "alias") or
                 std.mem.startsWith(u8, normalized_arg, "alias.") or
+                std.mem.eql(u8, normalized_arg, "--config-env") or
+                std.mem.startsWith(u8, normalized_arg, "--config-env=") or
                 std.mem.eql(u8, normalized_arg, "-c"))
             {
                 return false;
@@ -1328,6 +1330,9 @@ test "git config is blocked" {
     try std.testing.expect(!p.isCommandAllowed("git config core.editor \"rm -rf /\""));
     try std.testing.expect(!p.isCommandAllowed("git alias.st status"));
     try std.testing.expect(!p.isCommandAllowed("git -c core.editor=calc.exe commit"));
+    try std.testing.expect(!p.isCommandAllowed("git --config-env=alias.pwn=X pwn"));
+    try std.testing.expect(!p.isCommandAllowed("git --config-env alias.pwn=X pwn"));
+    try std.testing.expect(!p.isCommandAllowed("X=!id git --config-env=alias.pwn=X pwn"));
 }
 
 test "git quoted and escaped config args are blocked" {
@@ -1350,6 +1355,8 @@ test "git quote-concatenated config args are blocked" {
     try std.testing.expect(!p.isCommandAllowed("git 'co''nfig' user.name test"));
     try std.testing.expect(!p.isCommandAllowed("git \"-\"\"c\" core.editor=vim status"));
     try std.testing.expect(!p.isCommandAllowed("git $'co''nfig' user.name test"));
+    try std.testing.expect(!p.isCommandAllowed("git \"--config\"\"-env=alias.pwn=X\" pwn"));
+    try std.testing.expect(!p.isCommandAllowed("git $'--config-env=alias.pwn=X' pwn"));
 }
 
 test "git status is allowed" {
